@@ -1,0 +1,108 @@
+name: Build & Release Typst Resume
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Download Typst CLI tarball
+        run: |
+          curl -L \
+            -o typst.tar.xz \
+            https://github.com/typst/typst/releases/download/v0.13.1/typst-x86_64-unknown-linux-musl.tar.xz
+
+      - name: Extract and install Typst
+        run: |
+          # Extract the archive
+          tar -xJf typst.tar.xz
+          # Detect extracted directory and move the binary into PATH
+          DIR=$(tar -tf typst.tar.xz | head -n1 | cut -d/ -f1)
+          sudo mv "$DIR/typst" /usr/local/bin/typst
+
+      - name: Compile resume.typ → resume.pdf
+        id: typst_to_pdf
+        run: |
+          PDF_FILES=""
+          for i in $(ls *.typ); do
+              echo "Compiling $i"
+              typst compile --format pdf $i ${i%.typ}.pdf
+              PDF_FILES="$PDF_FILES${PDF_FILES:+$'\n'}${i%.typ}.pdf"
+          done
+          echo -e "pdf_files<<EOF\n$PDF_FILES\nEOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release Tag
+        if: github.event_name == 'push'
+        id: tag
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          # pick your own naming scheme:
+          TAG=resume-${GITHUB_SHA::8}
+          git tag -a $TAG -m "Release $TAG"
+          git push origin $TAG
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push'
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: ${{ steps.typst_to_pdf.outputs.pdf_files }}
+
+      - name: Upload PDF as artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: resume-pdfs-${{ github.run_number }}
+          path: ${{ steps.typst_to_pdf.outputs.pdf_files }}
+        id: upload
+
+      - name: Get artifact download URL
+        if: github.event_name == 'pull_request'
+        id: get_url
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const name = 'resume-pdfs-${{ github.run_number }}';
+            const res  = await github.rest.actions.listArtifactsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            const art = res.data.artifacts.find(a => a.name === name);
+            if (!art) throw new Error(`Artifact ${name} not found`);
+            const pr          = context.payload.pull_request.number;
+            const serverUrl   = process.env.GITHUB_SERVER_URL;
+            const repo        = process.env.GITHUB_REPOSITORY;
+            const runId       = process.env.GITHUB_RUN_ID;
+            const artifactId  = art.id;
+            const uiUrl = `${serverUrl}/${repo}/actions/runs/${runId}/artifacts/${artifactId}`;
+            core.setOutput('zip_url', uiUrl);
+
+      - name: Comment preview link on PR
+        if: github.event_name == 'pull_request'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ## 🚀 Resume PDF Preview
+            The latest compiled PDF(s) for this PR are available here:
+
+            [Download resume-pdfs.zip](${{ steps.get_url.outputs.zip_url }})
